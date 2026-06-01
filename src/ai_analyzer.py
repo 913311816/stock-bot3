@@ -1,18 +1,16 @@
 """
 AI 分析模块
-调用 Claude API 对每只股票生成深度分析报告（技术面 + 基本面 + 热度理由）
+调用 DeepSeek API 对每只股票生成深度分析报告（技术面 + 基本面 + 热度理由）
 """
 
 import os
-import json
 import logging
 import requests
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = "deepseek-chat"  # DeepSeek-V3，性价比最高
 
 
 def analyze_stock(
@@ -25,10 +23,10 @@ def analyze_stock(
     kline_summary: dict,
 ) -> str:
     """
-    调用 Claude API 生成股票深度分析报告
+    调用 DeepSeek API 生成股票深度分析报告
     """
-    if not ANTHROPIC_API_KEY:
-        logger.warning("未配置 ANTHROPIC_API_KEY，跳过 AI 分析")
+    if not DEEPSEEK_API_KEY:
+        logger.warning("未配置 DEEPSEEK_API_KEY，使用备用模板")
         return _generate_fallback_analysis(code, name, hot_rank, capital_inflow_3d, basic_info, news_list)
 
     # 构建新闻摘要
@@ -99,14 +97,13 @@ def analyze_stock(
 
     try:
         response = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.deepseek.com/chat/completions",
             headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
             },
             json={
-                "model": CLAUDE_MODEL,
+                "model": DEEPSEEK_MODEL,
                 "max_tokens": 1500,
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -114,11 +111,9 @@ def analyze_stock(
         )
         response.raise_for_status()
         data = response.json()
-        content = data.get("content", [])
-        text = "".join(c.get("text", "") for c in content if c.get("type") == "text")
-        return text.strip()
+        return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"Claude API 调用失败: {e}")
+        logger.error(f"DeepSeek API 调用失败: {e}")
         return _generate_fallback_analysis(code, name, hot_rank, capital_inflow_3d, basic_info, news_list)
 
 
@@ -126,7 +121,7 @@ def _generate_fallback_analysis(
     code: str, name: str, hot_rank: int, capital_inflow_3d: float,
     basic_info: dict, news_list: list[dict]
 ) -> str:
-    """Claude API 不可用时的备用分析"""
+    """API 不可用时的备用分析"""
     news_titles = "\n".join(f"• {n['title']}" for n in news_list[:4]) if news_list else "暂无资讯"
     return f"""## {name}（{code}）分析摘要
 
@@ -148,7 +143,7 @@ def _generate_fallback_analysis(
 2. 主力资金流入不代表股价必然上涨
 3. 本报告仅供参考，不构成投资建议
 
-*（注：AI深度分析需配置 ANTHROPIC_API_KEY）*"""
+*（注：AI深度分析需配置 DEEPSEEK_API_KEY）*"""
 
 
 def calculate_kline_summary(df) -> dict:
@@ -167,17 +162,12 @@ def calculate_kline_summary(df) -> dict:
     ma20 = df['close'].rolling(20).mean().iloc[-1]
     ma250 = df['close'].rolling(250).mean().iloc[-1] if len(df) >= 250 else df['close'].rolling(len(df)).mean().iloc[-1]
 
-    # 价格与年线的关系
     if not np.isnan(ma250):
         vs_ma250 = "上方（强势）" if last['close'] > ma250 else "下方（偏弱）"
     else:
         vs_ma250 = "（数据不足）"
 
-    # 近5日趋势
-    if len(df) >= 5:
-        trend_5d = f"{(last['close'] / df['close'].iloc[-5] - 1) * 100:+.2f}%"
-    else:
-        trend_5d = "N/A"
+    trend_5d = f"{(last['close'] / df['close'].iloc[-5] - 1) * 100:+.2f}%" if len(df) >= 5 else "N/A"
 
     return {
         "last_price": f"{last['close']:.2f}",
