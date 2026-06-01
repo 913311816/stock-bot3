@@ -199,7 +199,7 @@ def build_html_report(
     <!-- 底部免责声明 -->
     <div style="text-align:center;padding:24px;color:#484f58;font-size:12px;border-top:1px solid #21262d;margin-top:32px;">
         本报告由自动化程序生成，仅供参考学习，不构成任何投资建议。<br/>
-        股市有风险，投资需谨慎。数据来源：东方财富，AI 分析：Claude API。
+        股市有风险，投资需谨慎。数据来源：东方财富，AI 分析：DeepSeek API。
     </div>
 </div>
 </body>
@@ -223,7 +223,7 @@ def send_email(
     try:
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
-        msg['From'] = f'A股选股机器人 <{from_email}>'
+        msg['From'] = from_email  # QQ/163等国内邮箱要求From与SMTP账号完全一致
         msg['To'] = to_email
 
         part = MIMEText(html_content, 'html', 'utf-8')
