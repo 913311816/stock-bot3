@@ -1,7 +1,5 @@
-output/
 __pycache__/
 *.pyc
 .env
-*.png
-*.html
+output/
 .DS_Store
