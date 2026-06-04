@@ -1,211 +1,167 @@
-"""
-邮件报告生成与发送模块
-生成美观的 HTML 邮件，包含 K 线图（base64 内嵌）和 AI 分析报告
-"""
-
-import os
 import base64
+import html
 import logging
+import os
+import re
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
-from datetime import datetime
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-def img_to_base64(path: str) -> str:
-    """图片转 base64"""
-    try:
-        with open(path, 'rb') as f:
-            return base64.b64encode(f.read()).decode('utf-8')
-    except Exception:
+def _money_yi(value: float) -> str:
+    return f"{value / 1e8:.2f}亿元"
+
+
+def _image_data_uri(path: str) -> str:
+    if not path or not os.path.exists(path):
         return ""
+    with open(path, "rb") as file:
+        encoded = base64.b64encode(file.read()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
 
 
 def markdown_to_html(text: str) -> str:
-    """简单 Markdown 转 HTML"""
-    import re
-    # 标题
-    text = re.sub(r'^### (.+)$', r'<h3>\1</h3>', text, flags=re.MULTILINE)
-    text = re.sub(r'^## (.+)$', r'<h2>\1</h2>', text, flags=re.MULTILINE)
-    text = re.sub(r'^# (.+)$', r'<h1>\1</h1>', text, flags=re.MULTILINE)
-    # 加粗
-    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
-    # 列表
-    text = re.sub(r'^[\-\*] (.+)$', r'<li>\1</li>', text, flags=re.MULTILINE)
-    text = re.sub(r'(<li>.*</li>\n?)+', lambda m: f'<ul>{m.group()}</ul>', text, flags=re.DOTALL)
-    # 换行
-    text = text.replace('\n\n', '</p><p>').replace('\n', '<br/>')
-    text = f'<p>{text}</p>'
-    return text
+    safe = html.escape(text or "")
+    safe = re.sub(r"^### (.+)$", r"<h3>\1</h3>", safe, flags=re.MULTILINE)
+    safe = re.sub(r"^## (.+)$", r"<h2>\1</h2>", safe, flags=re.MULTILINE)
+    safe = re.sub(r"^- (.+)$", r"<li>\1</li>", safe, flags=re.MULTILINE)
+    safe = re.sub(r"(<li>.*?</li>\n?)+", lambda m: f"<ul>{m.group(0)}</ul>", safe, flags=re.DOTALL)
+    safe = safe.replace("\n\n", "</p><p>").replace("\n", "<br>")
+    return f"<p>{safe}</p>"
+
+
+def _render_rank_table(title: str, rows: list[dict], rank_key: str, value_key: str | None = None) -> str:
+    body = ""
+    for row in rows:
+        value = ""
+        if value_key == "capital_inflow_3d":
+            value = _money_yi(float(row.get(value_key, 0)))
+        elif value_key:
+            value = html.escape(str(row.get(value_key, "")))
+        body += f"""
+        <tr>
+          <td>#{row.get(rank_key, "-")}</td>
+          <td>{html.escape(row.get("name", ""))}</td>
+          <td>{html.escape(row.get("code", ""))}</td>
+          <td>{value}</td>
+        </tr>"""
+    return f"""
+    <section>
+      <h2>{html.escape(title)}</h2>
+      <table>
+        <thead><tr><th>排名</th><th>名称</th><th>代码</th><th>数值</th></tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </section>"""
 
 
 def build_html_report(
     date_str: str,
     stocks: list[dict],
-    analyses: dict,  # code -> analysis text
-    chart_paths: dict,  # code -> image path
+    analyses: dict[str, str],
+    chart_paths: dict[str, str],
+    hot_stocks: list[dict],
+    capital_stocks: list[dict],
 ) -> str:
-    """构建完整 HTML 邮件内容"""
-
-    stock_cards = ""
-    for i, stock in enumerate(stocks, 1):
-        code = stock['code']
-        name = stock['name']
-        hot_rank = stock.get('hot_rank', '-')
-        inflow = stock.get('capital_inflow_3d', 0)
-        inflow_bn = inflow / 1e8
-        price = stock.get('price', 0)
-        change_pct = stock.get('change_pct', 0)
-        pe = stock.get('pe_dynamic', 0)
-        market_cap = stock.get('market_cap', 0)
-
-        change_color = '#26a641' if change_pct >= 0 else '#f85149'
-        change_arrow = '▲' if change_pct >= 0 else '▼'
-
-        # K线图（base64内嵌）
-        chart_html = ""
-        chart_path = chart_paths.get(code, "")
-        if chart_path and os.path.exists(chart_path):
-            b64 = img_to_base64(chart_path)
-            if b64:
-                chart_html = f'<img src="data:image/png;base64,{b64}" style="width:100%;border-radius:8px;margin:12px 0;" alt="K线图"/>'
-        else:
-            chart_html = '<div style="background:#21262d;padding:20px;text-align:center;color:#8b949e;border-radius:8px;">K线图生成失败</div>'
-
-        # AI分析内容
-        analysis_raw = analyses.get(code, "分析数据获取中...")
-        analysis_html = markdown_to_html(analysis_raw)
-
-        # 市场标识
-        market = "SH" if code.startswith("6") else ("SZ" if code.startswith(("0", "3")) else "BJ")
-        market_color = "#e6594a" if market == "SH" else "#3d85c8"
-
-        stock_cards += f"""
-        <div style="background:#161b22;border:1px solid #30363d;border-radius:12px;margin:24px 0;overflow:hidden;">
-            <!-- 股票头部 -->
-            <div style="background:linear-gradient(135deg,#0d1117 0%,#1a2332 100%);padding:20px 24px;border-bottom:1px solid #30363d;">
-                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
-                    <div>
-                        <span style="background:{market_color};color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;margin-right:8px;">{market}</span>
-                        <span style="color:#e6edf3;font-size:22px;font-weight:700;">{name}</span>
-                        <span style="color:#8b949e;font-size:14px;margin-left:8px;">{code}</span>
-                    </div>
-                    <div style="text-align:right;">
-                        <div style="color:#e6edf3;font-size:24px;font-weight:700;">{price:.2f}</div>
-                        <div style="color:{change_color};font-size:14px;">{change_arrow} {abs(change_pct):.2f}%</div>
-                    </div>
-                </div>
-
-                <!-- 关键指标 -->
-                <div style="display:flex;gap:16px;margin-top:16px;flex-wrap:wrap;">
-                    <div style="background:#0d1117;border-radius:8px;padding:10px 16px;flex:1;min-width:100px;text-align:center;">
-                        <div style="color:#8b949e;font-size:11px;margin-bottom:4px;">热度排名</div>
-                        <div style="color:#f0e68c;font-size:18px;font-weight:700;">#{hot_rank}</div>
-                    </div>
-                    <div style="background:#0d1117;border-radius:8px;padding:10px 16px;flex:1;min-width:100px;text-align:center;">
-                        <div style="color:#8b949e;font-size:11px;margin-bottom:4px;">3日主力净流入</div>
-                        <div style="color:#26a641;font-size:18px;font-weight:700;">{inflow_bn:.2f}亿</div>
-                    </div>
-                    <div style="background:#0d1117;border-radius:8px;padding:10px 16px;flex:1;min-width:100px;text-align:center;">
-                        <div style="color:#8b949e;font-size:11px;margin-bottom:4px;">动态PE</div>
-                        <div style="color:#e6edf3;font-size:18px;font-weight:700;">{pe:.1f}x</div>
-                    </div>
-                    <div style="background:#0d1117;border-radius:8px;padding:10px 16px;flex:1;min-width:100px;text-align:center;">
-                        <div style="color:#8b949e;font-size:11px;margin-bottom:4px;">总市值</div>
-                        <div style="color:#e6edf3;font-size:18px;font-weight:700;">{market_cap:.0f}亿</div>
-                    </div>
-                </div>
+    cards = ""
+    for stock in stocks:
+        code = stock["code"]
+        image_uri = _image_data_uri(chart_paths.get(code, ""))
+        image_html = (
+            f'<img class="chart" src="{image_uri}" alt="{html.escape(stock["name"])} K线图">'
+            if image_uri
+            else '<div class="empty">K线图生成失败</div>'
+        )
+        analysis_html = markdown_to_html(analyses.get(code, "暂无分析"))
+        change = float(stock.get("change_pct", 0))
+        change_class = "up" if change >= 0 else "down"
+        cards += f"""
+        <article class="stock-card">
+          <header class="stock-header">
+            <div>
+              <span class="market">{html.escape(stock.get("market", ""))}</span>
+              <strong>{html.escape(stock.get("name", ""))}</strong>
+              <span class="code">{html.escape(code)}</span>
             </div>
-
-            <!-- K线图 -->
-            <div style="padding:16px 24px;border-bottom:1px solid #30363d;">
-                <div style="color:#8b949e;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">K线图（含MA5/MA10/MA20/MA250）</div>
-                {chart_html}
+            <div class="price">
+              <b>{float(stock.get("price", 0)):.2f}</b>
+              <span class="{change_class}">{change:+.2f}%</span>
             </div>
+          </header>
+          <div class="metrics">
+            <div><span>人气排名</span><b>#{stock.get("hot_rank")}</b></div>
+            <div><span>3日资金排名</span><b>#{stock.get("capital_rank")}</b></div>
+            <div><span>3日主力净流入</span><b>{_money_yi(float(stock.get("capital_inflow_3d", 0)))}</b></div>
+            <div><span>净流入占比</span><b>{float(stock.get("capital_inflow_3d_pct", 0)):.2f}%</b></div>
+          </div>
+          {image_html}
+          <div class="analysis">{analysis_html}</div>
+        </article>"""
 
-            <!-- AI分析 -->
-            <div style="padding:20px 24px;">
-                <div style="color:#8b949e;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:16px;">🤖 AI 深度分析</div>
-                <div style="color:#c9d1d9;font-size:14px;line-height:1.8;">
-                    {analysis_html}
-                </div>
-            </div>
-        </div>"""
-
-    # 邮件时间戳和统计
-    no_result_hint = ""
     if not stocks:
-        no_result_hint = """
-        <div style="text-align:center;padding:60px;color:#8b949e;">
-            <div style="font-size:40px;margin-bottom:16px;">📊</div>
-            <div style="font-size:18px;">今日未找到符合条件的股票</div>
-            <div style="font-size:13px;margin-top:8px;">热度前20 与 资金流入前20 暂无交集</div>
+        cards = """
+        <div class="no-result">
+          <h2>今日没有交集</h2>
+          <p>这不一定代表程序异常。报告下方保留了两个原始 Top20 榜单，可检查当天人气榜和3日资金流入榜是否确实没有重合。</p>
         </div>"""
 
-    html = f"""<!DOCTYPE html>
+    hot_table = _render_rank_table("东方财富人气榜 Top20", hot_stocks, "hot_rank", "change_pct")
+    capital_table = _render_rank_table("近3日主力净流入 Top20", capital_stocks, "capital_rank", "capital_inflow_3d")
+
+    return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<style>
-  body {{ margin:0;padding:0;background:#0d1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
-  h2 {{ color:#58a6ff;margin-top:24px;margin-bottom:8px; }}
-  h3 {{ color:#79c0ff;margin-top:16px;margin-bottom:6px; }}
-  p {{ color:#c9d1d9;margin:4px 0; }}
-  ul {{ padding-left:20px; }}
-  li {{ color:#c9d1d9;margin:4px 0; }}
-  strong {{ color:#e6edf3; }}
-  a {{ color:#58a6ff; }}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {{ margin:0; background:#f4f6f8; color:#17202a; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; }}
+    .wrap {{ max-width:980px; margin:0 auto; padding:24px; }}
+    .top {{ background:#ffffff; border:1px solid #dfe5ec; border-radius:8px; padding:22px 24px; margin-bottom:18px; }}
+    h1 {{ margin:0 0 8px; font-size:26px; }}
+    h2 {{ margin:22px 0 10px; font-size:18px; }}
+    h3 {{ margin:16px 0 6px; font-size:15px; }}
+    .summary {{ color:#64748b; font-size:14px; line-height:1.7; }}
+    .stock-card {{ background:#ffffff; border:1px solid #dfe5ec; border-radius:8px; margin:18px 0; overflow:hidden; }}
+    .stock-header {{ display:flex; justify-content:space-between; gap:16px; padding:18px 20px; border-bottom:1px solid #edf1f5; align-items:center; }}
+    .stock-header strong {{ font-size:22px; }}
+    .market {{ background:#1f6feb; color:white; border-radius:4px; padding:2px 7px; font-size:12px; margin-right:8px; }}
+    .code {{ color:#64748b; margin-left:8px; }}
+    .price {{ text-align:right; }}
+    .price b {{ display:block; font-size:22px; }}
+    .up {{ color:#c73838; }}
+    .down {{ color:#178a4d; }}
+    .metrics {{ display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:#edf1f5; }}
+    .metrics div {{ background:#fbfcfe; padding:12px; text-align:center; }}
+    .metrics span {{ display:block; color:#64748b; font-size:12px; margin-bottom:5px; }}
+    .metrics b {{ font-size:16px; }}
+    .chart {{ width:100%; display:block; }}
+    .analysis {{ padding:18px 22px; line-height:1.75; font-size:14px; }}
+    .empty,.no-result {{ background:#ffffff; border:1px solid #dfe5ec; border-radius:8px; padding:28px; text-align:center; color:#64748b; }}
+    section {{ background:#ffffff; border:1px solid #dfe5ec; border-radius:8px; padding:16px; margin:18px 0; }}
+    table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+    th,td {{ border-bottom:1px solid #edf1f5; padding:8px; text-align:left; }}
+    th {{ color:#64748b; font-weight:600; }}
+    .footer {{ color:#7b8794; font-size:12px; line-height:1.6; text-align:center; padding:20px 0; }}
+  </style>
 </head>
 <body>
-<div style="max-width:900px;margin:0 auto;padding:20px;">
-
-    <!-- 顶部标题栏 -->
-    <div style="background:linear-gradient(135deg,#1a2332 0%,#0d1117 100%);border:1px solid #30363d;border-radius:16px;padding:32px;margin-bottom:24px;text-align:center;">
-        <div style="font-size:28px;font-weight:800;color:#e6edf3;letter-spacing:-0.5px;">
-            📈 A股选股日报
-        </div>
-        <div style="color:#8b949e;font-size:14px;margin-top:8px;">{date_str}｜热度TOP20 ∩ 三日资金流入TOP20</div>
-        <div style="display:flex;justify-content:center;gap:32px;margin-top:20px;flex-wrap:wrap;">
-            <div style="text-align:center;">
-                <div style="color:#58a6ff;font-size:28px;font-weight:700;">{len(stocks)}</div>
-                <div style="color:#8b949e;font-size:12px;">今日入选</div>
-            </div>
-            <div style="text-align:center;">
-                <div style="color:#3fb950;font-size:28px;font-weight:700;">20</div>
-                <div style="color:#8b949e;font-size:12px;">热度筛选</div>
-            </div>
-            <div style="text-align:center;">
-                <div style="color:#d29922;font-size:28px;font-weight:700;">20</div>
-                <div style="color:#8b949e;font-size:12px;">资金筛选</div>
-            </div>
-        </div>
+  <div class="wrap">
+    <div class="top">
+      <h1>A股选股日报</h1>
+      <div class="summary">
+        日期：{html.escape(date_str)}<br>
+        策略：东方财富人气榜 Top20 与近3日主力净流入 Top20 取交集。今日入选 {len(stocks)} 只。
+      </div>
     </div>
-
-    <!-- 筛选说明 -->
-    <div style="background:#161b22;border:1px solid #30363d;border-left:4px solid #58a6ff;border-radius:8px;padding:14px 20px;margin-bottom:24px;font-size:13px;color:#8b949e;">
-        <strong style="color:#58a6ff;">筛选逻辑：</strong>
-        取「当日东方财富热度榜前20」与「近三日主力资金净流入前20」的交集，同时满足两个条件的股票才会入选本报告。
-    </div>
-
-    {no_result_hint}
-    {stock_cards}
-
-    <!-- 底部免责声明 -->
-    <div style="text-align:center;padding:24px;color:#484f58;font-size:12px;border-top:1px solid #21262d;margin-top:32px;">
-        本报告由自动化程序生成，仅供参考学习，不构成任何投资建议。<br/>
-        股市有风险，投资需谨慎。数据来源：东方财富，AI 分析：DeepSeek API。
-    </div>
-</div>
+    {cards}
+    {hot_table}
+    {capital_table}
+    <div class="footer">本报告由自动化程序生成，仅供学习和研究，不构成任何投资建议。股市有风险，投资需谨慎。</div>
+  </div>
 </body>
 </html>"""
-
-    return html
 
 
 def send_email(
@@ -219,28 +175,23 @@ def send_email(
     smtp_password: str,
     use_ssl: bool = False,
 ) -> bool:
-    """发送 HTML 邮件"""
     try:
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = subject
-        msg['From'] = from_email  # QQ/163等国内邮箱要求From与SMTP账号完全一致
-        msg['To'] = to_email
-
-        part = MIMEText(html_content, 'html', 'utf-8')
-        msg.attach(part)
+        message = MIMEMultipart("alternative")
+        message["Subject"] = subject
+        message["From"] = from_email
+        message["To"] = to_email
+        message.attach(MIMEText(html_content, "html", "utf-8"))
 
         if use_ssl:
             server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
         else:
             server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
             server.starttls()
-
         server.login(smtp_user, smtp_password)
-        server.sendmail(from_email, [to_email], msg.as_string())
+        server.sendmail(from_email, [to_email], message.as_string())
         server.quit()
-
-        logger.info(f"邮件发送成功: {to_email}")
+        logger.info("Email sent to %s", to_email)
         return True
-    except Exception as e:
-        logger.error(f"邮件发送失败: {e}")
+    except Exception as exc:
+        logger.exception("Email send failed: %s", exc)
         return False
