@@ -1,12 +1,44 @@
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 import akshare as ak
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
+
+
+def _call_akshare(func, *args, retries: int = 4, delay: float = 8.0, **kwargs):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except (requests.RequestException, ConnectionError, TimeoutError) as exc:
+            last_error = exc
+            wait = delay * attempt
+            logger.warning(
+                "AKShare request failed on attempt %s/%s: %s. Retrying in %.0fs",
+                attempt,
+                retries,
+                exc,
+                wait,
+            )
+            time.sleep(wait)
+        except Exception as exc:
+            last_error = exc
+            wait = delay * attempt
+            logger.warning(
+                "AKShare call failed on attempt %s/%s: %s. Retrying in %.0fs",
+                attempt,
+                retries,
+                exc,
+                wait,
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"AKShare call failed after {retries} attempts: {last_error}")
 
 
 def normalize_code(raw: object) -> str:
@@ -59,9 +91,13 @@ def _to_float(value: object) -> float:
 def get_hot_stocks(top_n: int = 20) -> list[dict]:
     """东方财富个股人气榜 Top N."""
     logger.info("Fetching Eastmoney hot rank Top %s", top_n)
-    df = ak.stock_hot_rank_em()
-    if df is None or df.empty:
-        raise RuntimeError("Hot rank API returned no data")
+    try:
+        df = _call_akshare(ak.stock_hot_rank_em)
+        if df is None or df.empty:
+            raise RuntimeError("Hot rank API returned no data")
+    except Exception as exc:
+        logger.exception("Hot rank API failed. The report will continue with an empty hot list: %s", exc)
+        return []
 
     code_col = _pick_column(df, ["代码", "股票代码"])
     name_col = _pick_column(df, ["股票名称", "名称", "证券名称"])
@@ -88,9 +124,13 @@ def get_hot_stocks(top_n: int = 20) -> list[dict]:
 def get_capital_flow_stocks(top_n: int = 20) -> list[dict]:
     """东方财富个股资金流排名，按 3 日主力净流入净额取 Top N."""
     logger.info("Fetching Eastmoney 3-day main fund inflow Top %s", top_n)
-    df = ak.stock_individual_fund_flow_rank(indicator="3日")
-    if df is None or df.empty:
-        raise RuntimeError("3-day fund flow API returned no data")
+    try:
+        df = _call_akshare(ak.stock_individual_fund_flow_rank, indicator="3日")
+        if df is None or df.empty:
+            raise RuntimeError("3-day fund flow API returned no data")
+    except Exception as exc:
+        logger.exception("3-day fund flow API failed. The report will continue with an empty fund list: %s", exc)
+        return []
 
     code_col = _pick_column(df, ["代码", "股票代码"])
     name_col = _pick_column(df, ["名称", "股票名称", "证券名称"])
@@ -150,7 +190,8 @@ def get_stock_kline_data(code: str, days: int = 320) -> Optional[pd.DataFrame]:
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
     try:
-        df = ak.stock_zh_a_hist(
+        df = _call_akshare(
+            ak.stock_zh_a_hist,
             symbol=code,
             period="daily",
             start_date=start,
@@ -187,7 +228,7 @@ def get_stock_kline_data(code: str, days: int = 320) -> Optional[pd.DataFrame]:
 
 def get_stock_news(code: str, name: str, limit: int = 8) -> list[dict]:
     try:
-        df = ak.stock_news_em(symbol=code)
+        df = _call_akshare(ak.stock_news_em, symbol=code, retries=3, delay=4.0)
         if df is None or df.empty:
             return []
         title_col = _pick_column(df, ["新闻标题", "标题"], contains=["标题"])
@@ -232,7 +273,7 @@ def get_stock_basic_info(code: str) -> dict:
     }
 
     try:
-        info = ak.stock_individual_info_em(symbol=code)
+        info = _call_akshare(ak.stock_individual_info_em, symbol=code, retries=3, delay=4.0)
         if info is not None and not info.empty:
             info_dict = {str(row.iloc[0]): row.iloc[1] for _, row in info.iterrows()}
             result.update(
@@ -246,7 +287,7 @@ def get_stock_basic_info(code: str) -> dict:
         logger.warning("Failed to fetch basic info for %s: %s", code, exc)
 
     try:
-        spot = ak.stock_zh_a_spot_em()
+        spot = _call_akshare(ak.stock_zh_a_spot_em, retries=3, delay=4.0)
         if spot is not None and not spot.empty and "代码" in spot.columns:
             row = spot[spot["代码"].astype(str).map(normalize_code) == code]
             if not row.empty:
