@@ -1,191 +1,267 @@
-"""
-股票筛选机器人
-数据来源：AKShare（封装了 emappdata.eastmoney.com，GitHub Actions 已验证可用）
-筛选逻辑：人气榜前20 ∩ 飙升榜前20
-  - 人气榜 stock_hot_rank_em：当前市场热度最高的股票
-  - 飙升榜 stock_hot_up_em：近期热度飙升最快的股票（≈资金快速涌入）
-"""
-
-import re
 import logging
+import re
+from datetime import datetime, timedelta
+from typing import Optional
+
 import akshare as ak
 import pandas as pd
-from typing import Optional
-from datetime import datetime, timedelta
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def _normalize_code(raw: str) -> str:
-    """
-    统一股票代码格式为6位纯数字
-    输入可能是：'SZ000665' / 'SH600519' / '000665' / '600519'
-    """
-    raw = str(raw).strip()
-    # 去掉市场前缀
-    cleaned = re.sub(r'^(SZ|SH|BJ|sz|sh|bj)', '', raw)
-    return cleaned.zfill(6)
+def normalize_code(raw: object) -> str:
+    text = str(raw or "").strip().upper()
+    text = re.sub(r"^(SH|SZ|BJ)", "", text)
+    text = re.sub(r"\.(SH|SZ|BJ)$", "", text)
+    match = re.search(r"(\d{6})", text)
+    return match.group(1) if match else text.zfill(6)
+
+
+def market_from_code(code: str) -> str:
+    if code.startswith(("5", "6", "9")):
+        return "SH"
+    if code.startswith(("4", "8")):
+        return "BJ"
+    return "SZ"
+
+
+def _pick_column(df: pd.DataFrame, candidates: list[str], contains: list[str] | None = None) -> str:
+    for name in candidates:
+        if name in df.columns:
+            return name
+    if contains:
+        for col in df.columns:
+            if all(part in str(col) for part in contains):
+                return str(col)
+    raise KeyError(f"Cannot find column. candidates={candidates}, columns={list(df.columns)}")
+
+
+def _to_float(value: object) -> float:
+    if value is None or pd.isna(value):
+        return 0.0
+    text = str(value).replace(",", "").replace("%", "").strip()
+    if text in {"", "-", "--", "None", "nan"}:
+        return 0.0
+    multiplier = 1.0
+    if text.endswith("亿"):
+        multiplier = 1e8
+        text = text[:-1]
+    elif text.endswith("万"):
+        multiplier = 1e4
+        text = text[:-1]
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        return float(match.group(0)) * multiplier if match else 0.0
 
 
 def get_hot_stocks(top_n: int = 20) -> list[dict]:
-    """人气榜前N（东方财富实时热度榜）"""
-    logger.info("获取热度榜（东方财富人气榜）...")
-    try:
-        df = ak.stock_hot_rank_em()
-        if df is None or df.empty:
-            raise ValueError("人气榜返回空")
-        stocks = []
-        for i, row in enumerate(df.head(top_n).itertuples(), 1):
-            code = _normalize_code(str(row.代码))
-            stocks.append({
+    """东方财富个股人气榜 Top N."""
+    logger.info("Fetching Eastmoney hot rank Top %s", top_n)
+    df = ak.stock_hot_rank_em()
+    if df is None or df.empty:
+        raise RuntimeError("Hot rank API returned no data")
+
+    code_col = _pick_column(df, ["代码", "股票代码"])
+    name_col = _pick_column(df, ["股票名称", "名称", "证券名称"])
+    price_col = _pick_column(df, ["最新价", "最新价格"], contains=["最新"])
+    pct_col = _pick_column(df, ["涨跌幅", "涨跌幅%"], contains=["涨跌幅"])
+
+    result: list[dict] = []
+    for rank, (_, row) in enumerate(df.head(top_n).iterrows(), start=1):
+        code = normalize_code(row[code_col])
+        result.append(
+            {
                 "code": code,
-                "name": str(row.股票名称),
-                "hot_rank": i,
-                "price": float(row.最新价) if hasattr(row, '最新价') and row.最新价 else 0,
-                "change_pct": float(row.涨跌幅) if hasattr(row, '涨跌幅') and row.涨跌幅 else 0,
-            })
-        logger.info(f"人气榜获取 {len(stocks)} 只 | 示例代码: {[s['code'] for s in stocks[:3]]}")
-        return stocks
-    except Exception as e:
-        logger.error(f"人气榜失败: {e}")
-        return []
+                "name": str(row[name_col]),
+                "market": market_from_code(code),
+                "hot_rank": rank,
+                "price": _to_float(row.get(price_col)),
+                "change_pct": _to_float(row.get(pct_col)),
+            }
+        )
+    logger.info("Hot rank codes: %s", [s["code"] for s in result])
+    return result
 
 
 def get_capital_flow_stocks(top_n: int = 20) -> list[dict]:
-    """飙升榜前N（近期热度上升最快，与资金涌入高度相关）"""
-    logger.info("获取飙升榜（东方财富热度飙升榜）...")
+    """东方财富个股资金流排名，按 3 日主力净流入净额取 Top N."""
+    logger.info("Fetching Eastmoney 3-day main fund inflow Top %s", top_n)
+    df = ak.stock_individual_fund_flow_rank(indicator="3日")
+    if df is None or df.empty:
+        raise RuntimeError("3-day fund flow API returned no data")
+
+    code_col = _pick_column(df, ["代码", "股票代码"])
+    name_col = _pick_column(df, ["名称", "股票名称", "证券名称"])
+    inflow_col = _pick_column(
+        df,
+        ["3日主力净流入-净额", "主力净流入-净额", "主力净流入净额"],
+        contains=["主力", "净流入", "净额"],
+    )
+    pct_col = None
     try:
-        df = ak.stock_hot_up_em()
-        if df is None or df.empty:
-            raise ValueError("飙升榜返回空")
-        stocks = []
-        for i, row in enumerate(df.head(top_n).itertuples(), 1):
-            code = _normalize_code(str(row.代码))
-            change = float(row.涨跌幅) if hasattr(row, '涨跌幅') and row.涨跌幅 else 0
-            stocks.append({
+        pct_col = _pick_column(
+            df,
+            ["3日主力净流入-净占比", "主力净流入-净占比", "主力净流入净占比"],
+            contains=["主力", "净流入", "净占比"],
+        )
+    except KeyError:
+        pass
+
+    work = df.copy()
+    work["_capital_inflow_3d"] = work[inflow_col].map(_to_float)
+    work = work.sort_values("_capital_inflow_3d", ascending=False)
+    work = work[work["_capital_inflow_3d"] > 0].head(top_n)
+
+    result: list[dict] = []
+    for rank, (_, row) in enumerate(work.iterrows(), start=1):
+        code = normalize_code(row[code_col])
+        result.append(
+            {
                 "code": code,
-                "name": str(row.股票名称),
-                "surge_rank": i,
-                "capital_inflow_3d": change * 1e8,  # 用涨幅估算，展示用
-                "capital_inflow_3d_pct": change,
-            })
-        logger.info(f"飙升榜获取 {len(stocks)} 只 | 示例代码: {[s['code'] for s in stocks[:3]]}")
-        return stocks
-    except Exception as e:
-        logger.error(f"飙升榜失败: {e}")
-        return []
+                "name": str(row[name_col]),
+                "market": market_from_code(code),
+                "capital_rank": rank,
+                "capital_inflow_3d": float(row["_capital_inflow_3d"]),
+                "capital_inflow_3d_pct": _to_float(row[pct_col]) if pct_col else 0.0,
+            }
+        )
+    logger.info("3-day fund flow codes: %s", [s["code"] for s in result])
+    return result
 
 
 def get_intersection(hot_stocks: list[dict], capital_stocks: list[dict]) -> list[dict]:
-    """取人气榜和飙升榜的交集"""
-    hot_codes = {s["code"]: s for s in hot_stocks}
-    surge_codes = {s["code"]: s for s in capital_stocks}
+    hot_by_code = {s["code"]: s for s in hot_stocks}
+    capital_by_code = {s["code"]: s for s in capital_stocks}
 
-    # 调试：打印两个榜的代码方便排查
-    logger.info(f"人气榜代码: {sorted(hot_codes.keys())}")
-    logger.info(f"飙升榜代码: {sorted(surge_codes.keys())}")
+    selected = []
+    for code, hot in hot_by_code.items():
+        capital = capital_by_code.get(code)
+        if capital:
+            selected.append({**hot, **capital})
 
-    intersection = []
-    for code in hot_codes:
-        if code in surge_codes:
-            intersection.append({**hot_codes[code], **surge_codes[code]})
-
-    logger.info(f"交集结果: {len(intersection)} 只股票")
-    for s in intersection:
-        logger.info(f"  {s['code']} {s['name']} | 人气排名:{s.get('hot_rank')} | 飙升排名:{s.get('surge_rank','?')}")
-    return intersection
+    selected.sort(key=lambda item: (item.get("hot_rank", 999), item.get("capital_rank", 999)))
+    logger.info("Intersection size: %s, codes: %s", len(selected), [s["code"] for s in selected])
+    return selected
 
 
-def get_stock_market(code: str) -> str:
-    return "sh" if code.startswith("6") else "sz"
-
-
-def get_stock_kline_data(code: str, days: int = 300) -> Optional[pd.DataFrame]:
-    """K线数据（AKShare，前复权日线）"""
+def get_stock_kline_data(code: str, days: int = 320) -> Optional[pd.DataFrame]:
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
     try:
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                start_date=start, end_date=end, adjust="qfq")
+        df = ak.stock_zh_a_hist(
+            symbol=code,
+            period="daily",
+            start_date=start,
+            end_date=end,
+            adjust="qfq",
+        )
         if df is None or df.empty:
             return None
-        df = df.rename(columns={
-            "日期": "date", "开盘": "open", "收盘": "close",
-            "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount"
-        })
+        df = df.rename(
+            columns={
+                "日期": "date",
+                "开盘": "open",
+                "收盘": "close",
+                "最高": "high",
+                "最低": "low",
+                "成交量": "volume",
+                "成交额": "amount",
+                "涨跌幅": "change_pct",
+            }
+        )
+        required = ["date", "open", "close", "high", "low", "volume"]
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise KeyError(f"K-line missing columns: {missing}, columns={list(df.columns)}")
         df["date"] = pd.to_datetime(df["date"])
-        return df.set_index("date").sort_index().tail(days)
-    except Exception as e:
-        logger.error(f"K线数据失败 {code}: {e}")
+        for col in ["open", "close", "high", "low", "volume", "amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["open", "close", "high", "low"]).set_index("date").sort_index().tail(days)
+    except Exception as exc:
+        logger.exception("Failed to fetch K-line for %s: %s", code, exc)
         return None
 
 
-def get_stock_news(code: str, name: str) -> list[dict]:
-    """个股新闻（AKShare）"""
+def get_stock_news(code: str, name: str, limit: int = 8) -> list[dict]:
     try:
         df = ak.stock_news_em(symbol=code)
         if df is None or df.empty:
             return []
+        title_col = _pick_column(df, ["新闻标题", "标题"], contains=["标题"])
+        date_col = _pick_column(df, ["发布时间", "时间", "日期"], contains=["时间"])
+        url_col = None
+        for candidate in ["新闻链接", "链接", "url", "URL"]:
+            if candidate in df.columns:
+                url_col = candidate
+                break
+        content_col = None
+        for candidate in ["新闻内容", "内容", "摘要"]:
+            if candidate in df.columns:
+                content_col = candidate
+                break
         news = []
-        for row in df.head(8).itertuples():
-            news.append({
-                "title": str(getattr(row, "新闻标题", "") or ""),
-                "date": str(getattr(row, "发布时间", "") or ""),
-                "url": str(getattr(row, "新闻链接", "") or ""),
-                "digest": str(getattr(row, "新闻内容", "") or "")[:150],
-            })
+        for _, row in df.head(limit).iterrows():
+            news.append(
+                {
+                    "title": str(row.get(title_col, "")),
+                    "date": str(row.get(date_col, "")),
+                    "url": str(row.get(url_col, "")) if url_col else "",
+                    "digest": str(row.get(content_col, ""))[:200] if content_col else "",
+                }
+            )
         return news
-    except Exception as e:
-        logger.error(f"获取新闻失败 {code}: {e}")
+    except Exception as exc:
+        logger.warning("Failed to fetch news for %s %s: %s", code, name, exc)
         return []
 
 
 def get_stock_basic_info(code: str) -> dict:
-    """股票基本面数据"""
-    def safe_float(val):
-        try:
-            return float(str(val).replace(",", "").replace("%", "").strip())
-        except:
-            return 0
+    result = {
+        "price": 0.0,
+        "change_pct": 0.0,
+        "pe_dynamic": 0.0,
+        "pb": 0.0,
+        "market_cap": 0.0,
+        "float_cap": 0.0,
+        "turnover_rate": 0.0,
+        "volume_ratio": 0.0,
+        "industry": "",
+    }
 
-    result = {"price": 0, "change_pct": 0, "pe_dynamic": 0, "pe_static": 0,
-              "pb": 0, "market_cap": 0, "float_cap": 0, "turnover_rate": 0,
-              "52w_high": 0, "52w_low": 0, "volume_ratio": 0}
     try:
         info = ak.stock_individual_info_em(symbol=code)
         if info is not None and not info.empty:
-            info_dict = {str(r.iloc[0]): r.iloc[1] for _, r in info.iterrows()}
-            result.update({
-                "pe_dynamic": safe_float(info_dict.get("市盈率(动态)", 0)),
-                "pe_static":  safe_float(info_dict.get("市盈率(静态)", 0)),
-                "pb":          safe_float(info_dict.get("市净率", 0)),
-                "market_cap":  safe_float(info_dict.get("总市值", 0)) / 1e8,
-                "float_cap":   safe_float(info_dict.get("流通市值", 0)) / 1e8,
-            })
-    except Exception as e:
-        logger.warning(f"基本信息失败 {code}: {e}")
+            info_dict = {str(row.iloc[0]): row.iloc[1] for _, row in info.iterrows()}
+            result.update(
+                {
+                    "market_cap": _to_float(info_dict.get("总市值", 0)) / 1e8,
+                    "float_cap": _to_float(info_dict.get("流通市值", 0)) / 1e8,
+                    "industry": str(info_dict.get("行业", "") or ""),
+                }
+            )
+    except Exception as exc:
+        logger.warning("Failed to fetch basic info for %s: %s", code, exc)
 
     try:
         spot = ak.stock_zh_a_spot_em()
-        row = spot[spot["代码"] == code]
-        if not row.empty:
-            result["price"] = safe_float(row["最新价"].values[0])
-            result["change_pct"] = safe_float(row["涨跌幅"].values[0])
-            if "换手率" in row.columns:
-                result["turnover_rate"] = safe_float(row["换手率"].values[0])
-            if "量比" in row.columns:
-                result["volume_ratio"] = safe_float(row["量比"].values[0])
-    except Exception as e:
-        logger.warning(f"实时行情失败 {code}: {e}")
+        if spot is not None and not spot.empty and "代码" in spot.columns:
+            row = spot[spot["代码"].astype(str).map(normalize_code) == code]
+            if not row.empty:
+                row = row.iloc[0]
+                result.update(
+                    {
+                        "price": _to_float(row.get("最新价", 0)),
+                        "change_pct": _to_float(row.get("涨跌幅", 0)),
+                        "pe_dynamic": _to_float(row.get("市盈率-动态", row.get("市盈率", 0))),
+                        "pb": _to_float(row.get("市净率", 0)),
+                        "turnover_rate": _to_float(row.get("换手率", 0)),
+                        "volume_ratio": _to_float(row.get("量比", 0)),
+                    }
+                )
+    except Exception as exc:
+        logger.warning("Failed to fetch spot info for %s: %s", code, exc)
 
     return result
-
-
-if __name__ == "__main__":
-    hot = get_hot_stocks(20)
-    capital = get_capital_flow_stocks(20)
-    result = get_intersection(hot, capital)
-    print(f"\n最终筛选结果: {len(result)} 只股票")
-    for s in result:
-        print(f"  {s['code']} {s['name']}")
