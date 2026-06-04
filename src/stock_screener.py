@@ -129,8 +129,9 @@ def get_capital_flow_stocks(top_n: int = 20) -> list[dict]:
         if df is None or df.empty:
             raise RuntimeError("3-day fund flow API returned no data")
     except Exception as exc:
-        logger.exception("3-day fund flow API failed. The report will continue with an empty fund list: %s", exc)
-        return []
+        logger.warning("Eastmoney 3-day fund flow API failed: %s", exc)
+        logger.info("Falling back to Tonghuashun 3-day fund flow ranking")
+        return get_capital_flow_stocks_fallback(top_n=top_n)
 
     code_col = _pick_column(df, ["代码", "股票代码"])
     name_col = _pick_column(df, ["名称", "股票名称", "证券名称"])
@@ -168,6 +169,43 @@ def get_capital_flow_stocks(top_n: int = 20) -> list[dict]:
             }
         )
     logger.info("3-day fund flow codes: %s", [s["code"] for s in result])
+    return result
+
+
+def get_capital_flow_stocks_fallback(top_n: int = 20) -> list[dict]:
+    """同花顺个股资金流 3日排行，作为东方财富资金流接口不可用时的备用源。"""
+    try:
+        df = _call_akshare(ak.stock_fund_flow_individual, symbol="3日排行")
+        if df is None or df.empty:
+            raise RuntimeError("Tonghuashun 3-day fund flow API returned no data")
+    except Exception as exc:
+        logger.exception("All 3-day fund flow APIs failed. The report will continue with an empty fund list: %s", exc)
+        return []
+
+    code_col = _pick_column(df, ["股票代码", "代码"])
+    name_col = _pick_column(df, ["股票简称", "名称", "股票名称"])
+    inflow_col = _pick_column(df, ["资金流入净额", "净额"], contains=["资金", "净额"])
+
+    work = df.copy()
+    work["_capital_inflow_3d"] = work[inflow_col].map(_to_float)
+    work = work.sort_values("_capital_inflow_3d", ascending=False)
+    work = work[work["_capital_inflow_3d"] > 0].head(top_n)
+
+    result: list[dict] = []
+    for rank, (_, row) in enumerate(work.iterrows(), start=1):
+        code = normalize_code(row[code_col])
+        result.append(
+            {
+                "code": code,
+                "name": str(row[name_col]),
+                "market": market_from_code(code),
+                "capital_rank": rank,
+                "capital_inflow_3d": float(row["_capital_inflow_3d"]),
+                "capital_inflow_3d_pct": 0.0,
+                "capital_source": "同花顺3日资金流排行",
+            }
+        )
+    logger.info("Fallback 3-day fund flow codes: %s", [s["code"] for s in result])
     return result
 
 
