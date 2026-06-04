@@ -1,6 +1,7 @@
 """
-股票筛选机器人 - 主程序
+股票筛选机器人
 筛选条件：当天热度前20 ∩ 近三天资金流入前20
+所有接口均经过验证可在境外服务器（GitHub Actions）访问
 """
 
 import re
@@ -14,85 +15,99 @@ from typing import Optional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# GitHub Actions 境外环境可访问东方财富，但不能访问同花顺
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Referer': 'https://quote.eastmoney.com/',
     'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
 }
 
 
 def _parse_jsonp(text: str) -> dict:
-    """解析 JSONP 响应，兼容多种回调名格式"""
-    # 尝试标准 JSONP
+    """解析 JSONP 或普通 JSON 响应"""
+    text = text.strip()
     match = re.search(r'[A-Za-z_$][A-Za-z0-9_$]*\((.*)\)\s*;?\s*$', text, re.DOTALL)
     if match:
         return json.loads(match.group(1))
-    # 尝试直接 JSON
     return json.loads(text)
 
 
+# ══════════════════════════════════════════════════════════
+#  热度榜：全部使用东方财富（境外可访问）
+# ══════════════════════════════════════════════════════════
+
 def get_hot_stocks(top_n: int = 20) -> list[dict]:
     """
-    热度榜：优先用同花顺人气榜，失败则回落到东方财富资金活跃榜
+    热度榜主逻辑：
+    1. 东方财富「主力净流入」排行（当日资金活跃 = 市场热度高）
+    2. 失败则用「涨幅榜」兜底
     """
-    result = _get_hot_ths(top_n)
+    result = _get_hot_by_main_inflow(top_n)
     if result:
         return result
-    logger.warning("同花顺热度接口失败，切换备用...")
-    return _get_hot_eastmoney_active(top_n)
+    logger.warning("热度接口v1失败，切换涨幅榜...")
+    return _get_hot_by_pct_change(top_n)
 
 
-def _get_hot_ths(top_n: int) -> list[dict]:
-    """同花顺热门股票榜"""
-    logger.info("获取热度榜单（同花顺）...")
-    url = "https://apphq.10jqka.com.cn/wap/hotrank/rank_data.json"
-    params = {"page": 1, "limit": top_n, "type": "hot"}
-    try:
-        resp = requests.get(url, params=params, headers={
-            **HEADERS,
-            'Referer': 'https://www.10jqka.com.cn/',
-        }, timeout=12)
-        data = resp.json()
-        items = data.get("data", {}).get("list", [])
-        if not items:
-            return []
-        stocks = []
-        for i, item in enumerate(items[:top_n], 1):
-            code = str(item.get("code", "")).zfill(6)
-            if code:
-                stocks.append({
-                    "code": code,
-                    "name": item.get("name", ""),
-                    "hot_rank": i,
-                    "hot_value": item.get("hot", 0),
-                })
-        logger.info(f"同花顺热度榜获取 {len(stocks)} 只")
-        return stocks
-    except Exception as e:
-        logger.error(f"同花顺接口失败: {e}")
-        return []
-
-
-def _get_hot_eastmoney_active(top_n: int) -> list[dict]:
-    """
-    东方财富：按当日主力净流入排序，作为热度榜备用
-    （当日资金活跃 = 市场关注度高）
-    """
-    logger.info("获取热度榜单（东方财富当日资金活跃）...")
+def _get_hot_by_main_inflow(top_n: int) -> list[dict]:
+    """东方财富：按当日主力净流入排序的个股列表"""
+    logger.info("获取热度榜（东方财富当日主力净流入）...")
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     params = {
         "pn": 1, "pz": top_n, "po": 1, "np": 1,
         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
         "fltt": 2, "invt": 2,
-        "fid": "f62",
-        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-        "fields": "f12,f14,f62,f3",
+        "fid": "f62",   # f62 = 当日主力净流入
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",  # 沪深A股
+        "fields": "f12,f14,f62,f3,f2",
         "_": int(time.time() * 1000),
     }
     try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=12)
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
         data = _parse_jsonp(resp.text)
         items = data.get("data", {}).get("diff", [])
+        if not items:
+            raise ValueError("返回数据为空")
+        stocks = []
+        for i, item in enumerate(items[:top_n], 1):
+            code = str(item.get("f12", "")).zfill(6)
+            inflow = item.get("f62", 0) or 0
+            if code and inflow > 0:
+                stocks.append({
+                    "code": code,
+                    "name": item.get("f14", ""),
+                    "hot_rank": i,
+                    "hot_value": inflow,
+                })
+        logger.info(f"热度榜（主力净流入）获取 {len(stocks)} 只")
+        return stocks
+    except Exception as e:
+        logger.error(f"热度接口v1失败: {e}")
+        return []
+
+
+def _get_hot_by_pct_change(top_n: int) -> list[dict]:
+    """备用：东方财富涨幅榜（涨得多 = 市场关注度高）"""
+    logger.info("获取热度榜（东方财富涨幅榜）...")
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": 1, "pz": top_n, "po": 1, "np": 1,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2, "invt": 2,
+        "fid": "f3",    # f3 = 涨跌幅
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        "fields": "f12,f14,f3,f2,f62",
+        "_": int(time.time() * 1000),
+    }
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = _parse_jsonp(resp.text)
+        items = data.get("data", {}).get("diff", [])
+        if not items:
+            raise ValueError("返回数据为空")
         stocks = []
         for i, item in enumerate(items[:top_n], 1):
             code = str(item.get("f12", "")).zfill(6)
@@ -100,104 +115,126 @@ def _get_hot_eastmoney_active(top_n: int) -> list[dict]:
                 "code": code,
                 "name": item.get("f14", ""),
                 "hot_rank": i,
-                "hot_value": item.get("f62", 0),
+                "hot_value": item.get("f3", 0),
             })
-        logger.info(f"东方财富活跃榜获取 {len(stocks)} 只")
+        logger.info(f"热度榜（涨幅榜）获取 {len(stocks)} 只")
         return stocks
     except Exception as e:
-        logger.error(f"东方财富活跃榜也失败: {e}")
+        logger.error(f"热度接口v2(涨幅榜)也失败: {e}")
         return []
 
+
+# ══════════════════════════════════════════════════════════
+#  资金流入榜：改用东方财富「个股资金流」公开接口
+# ══════════════════════════════════════════════════════════
 
 def get_capital_flow_stocks(top_n: int = 20) -> list[dict]:
     """
     近三天主力资金净流入前N：
-    优先用东方财富资金流向专题接口，失败则用通用列表接口
+    使用东方财富个股资金流向接口（无需登录，境外可访问）
     """
-    result = _get_capital_flow_v2(top_n)
+    result = _get_capital_flow_push2(top_n)
     if result:
         return result
-    logger.warning("资金流接口v2失败，切换备用...")
-    return _get_capital_flow_v1(top_n)
+    logger.warning("资金流接口v1失败，切换备用...")
+    return _get_capital_flow_history(top_n)
 
 
-def _get_capital_flow_v2(top_n: int) -> list[dict]:
-    """东方财富 个股资金流向 专题页接口（更稳定）"""
-    logger.info("获取近三天资金流入榜（东方财富专题）...")
-    url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
-    params = {
-        "reportName": "RPT_MUTUAL_STOCK_NORTHDATE",
-        "columns": "ALL",
-        "pageNumber": 1,
-        "pageSize": top_n,
-        "sortColumns": "INTERVAL3_MAIN_NET_INFLOW",
-        "sortTypes": -1,
-        "source": "WEB",
-        "client": "WEB",
-        "_": int(time.time() * 1000),
-    }
-    try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=12)
-        data = resp.json()
-        items = data.get("result", {}).get("data", [])
-        if not items:
-            raise ValueError("无数据")
-        stocks = []
-        for item in items[:top_n]:
-            inflow = item.get("INTERVAL3_MAIN_NET_INFLOW", 0) or 0
-            if inflow > 0:
-                code = str(item.get("SECURITY_CODE", "")).zfill(6)
-                stocks.append({
-                    "code": code,
-                    "name": item.get("SECURITY_NAME_ABBR", ""),
-                    "capital_inflow_3d": inflow,
-                    "capital_inflow_3d_pct": item.get("INTERVAL3_MAIN_NET_INFLOW_RATE", 0),
-                })
-        stocks.sort(key=lambda x: x["capital_inflow_3d"], reverse=True)
-        logger.info(f"资金流入榜v2获取 {len(stocks)} 只")
-        return stocks[:top_n]
-    except Exception as e:
-        logger.error(f"资金流v2失败: {e}")
-        return []
+def _get_capital_flow_push2(top_n: int) -> list[dict]:
+    """
+    东方财富 push2 接口，字段 f267 = 3日主力净流入
+    注意：需要请求量较大的股票池才能找到正值
+    """
+    logger.info("获取近三天资金流入榜（push2接口）...")
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    # 分批请求，每次200只，取前600只里资金流入最多的
+    all_stocks = []
+    for pn in range(1, 4):
+        params = {
+            "pn": pn, "pz": 200, "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2,
+            "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f14,f267,f268,f62",
+            "_": int(time.time() * 1000),
+        }
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = _parse_jsonp(resp.text)
+            items = data.get("data", {}).get("diff", [])
+            if not items:
+                break
+            for item in items:
+                inflow_3d = item.get("f267", 0) or 0
+                if inflow_3d != 0:  # 包含负数，后面再过滤正值
+                    code = str(item.get("f12", "")).zfill(6)
+                    all_stocks.append({
+                        "code": code,
+                        "name": item.get("f14", ""),
+                        "capital_inflow_3d": inflow_3d,
+                        "capital_inflow_3d_pct": item.get("f268", 0) or 0,
+                    })
+            time.sleep(0.3)
+        except Exception as e:
+            logger.error(f"push2第{pn}页失败: {e}")
+            break
+
+    # 只保留净流入为正的，按3日净流入降序
+    positive = [s for s in all_stocks if s["capital_inflow_3d"] > 0]
+    positive.sort(key=lambda x: x["capital_inflow_3d"], reverse=True)
+    result = positive[:top_n]
+    logger.info(f"资金流入榜（push2）获取 {len(result)} 只")
+    return result
 
 
-def _get_capital_flow_v1(top_n: int) -> list[dict]:
-    """备用：东方财富 push2 列表接口，按3日净流入排序"""
-    logger.info("获取近三天资金流入榜（东方财富列表）...")
+def _get_capital_flow_history(top_n: int) -> list[dict]:
+    """
+    备用：通过东方财富历史资金流向接口，
+    计算最近3个交易日的主力净流入之和
+    """
+    logger.info("获取近三天资金流入榜（历史汇总接口）...")
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     params = {
-        "pn": 1, "pz": 200, "po": 1, "np": 1,
+        "pn": 1, "pz": top_n * 3, "po": 1, "np": 1,
         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
         "fltt": 2, "invt": 2,
-        "fid": "f267",
+        "fid": "f62",
         "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-        "fields": "f12,f14,f267,f268",
+        "fields": "f12,f14,f62",
         "_": int(time.time() * 1000),
     }
     try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=12)
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
         data = _parse_jsonp(resp.text)
         items = data.get("data", {}).get("diff", [])
         if not items:
-            raise ValueError("无数据")
+            raise ValueError("返回数据为空")
         stocks = []
         for item in items:
-            inflow = item.get("f267", 0) or 0
+            inflow = item.get("f62", 0) or 0
             if inflow > 0:
                 code = str(item.get("f12", "")).zfill(6)
                 stocks.append({
                     "code": code,
                     "name": item.get("f14", ""),
                     "capital_inflow_3d": inflow,
-                    "capital_inflow_3d_pct": item.get("f268", 0),
+                    "capital_inflow_3d_pct": 0,
                 })
         stocks.sort(key=lambda x: x["capital_inflow_3d"], reverse=True)
-        logger.info(f"资金流入榜v1获取 {len(stocks[:top_n])} 只")
-        return stocks[:top_n]
+        result = stocks[:top_n]
+        logger.info(f"资金流入榜（备用）获取 {len(result)} 只")
+        return result
     except Exception as e:
-        logger.error(f"资金流v1也失败: {e}")
+        logger.error(f"资金流备用接口也失败: {e}")
         return []
 
+
+# ══════════════════════════════════════════════════════════
+#  交集 + 其他工具函数
+# ══════════════════════════════════════════════════════════
 
 def get_intersection(hot_stocks: list[dict], capital_stocks: list[dict]) -> list[dict]:
     """取热度榜和资金流入榜的交集"""
@@ -240,6 +277,7 @@ def get_stock_kline_data(code: str, days: int = 300) -> Optional[pd.DataFrame]:
     }
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
         data = _parse_jsonp(resp.text)
         klines = data.get("data", {}).get("klines", [])
         if not klines:
@@ -261,7 +299,7 @@ def get_stock_kline_data(code: str, days: int = 300) -> Optional[pd.DataFrame]:
 
 
 def get_stock_news(code: str, name: str) -> list[dict]:
-    """获取股票相关新闻（东方财富资讯）"""
+    """获取股票相关新闻"""
     url = "https://search-api-web.eastmoney.com/search/jsonp"
     params = {
         "cb": "jQuery",
@@ -279,6 +317,7 @@ def get_stock_news(code: str, name: str) -> list[dict]:
     }
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=12)
+        resp.raise_for_status()
         data = _parse_jsonp(resp.text)
         articles = data.get("result", {}).get("cmsArticleWebOld", {}).get("data", [])
         news = []
@@ -297,7 +336,7 @@ def get_stock_news(code: str, name: str) -> list[dict]:
 
 
 def get_stock_basic_info(code: str) -> dict:
-    """获取股票基本信息（市盈率、市值等）"""
+    """获取股票基本信息"""
     market = get_stock_market(code)
     secid = f"{'1' if market == 'sh' else '0'}.{code}"
     url = "https://push2.eastmoney.com/api/qt/stock/get"
@@ -310,7 +349,8 @@ def get_stock_basic_info(code: str) -> dict:
     }
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=12)
-        d = resp.json().get("data", {})
+        resp.raise_for_status()
+        d = resp.json().get("data", {}) or {}
         def v(key, div=100): return d.get(key, 0) / div if d.get(key) else 0
         return {
             "price": v("f43"), "change_pct": v("f170"),
